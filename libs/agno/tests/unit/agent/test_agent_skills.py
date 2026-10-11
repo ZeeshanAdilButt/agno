@@ -22,7 +22,7 @@ import pytest
 
 from agno.agent._messages import aget_system_message, get_system_message
 from agno.agent._tools import aget_tools, get_tools
-from agno.agent.agent import Agent, get_agent_by_id
+from agno.agent.agent import Agent, get_agent_by_id, get_agents
 from agno.exceptions import ComponentRehydrationError
 from agno.models.base import Function
 from agno.models.openai import OpenAIResponses
@@ -928,3 +928,58 @@ def test_the_config_db_answers_over_an_explicitly_passed_db(tmp_path):
         assert loaded.skills is not None
         instructions = json.loads(loaded.skills._get_skill_instructions("release-notes"))
         assert instructions["instructions"] == "Instructions for release-notes."
+
+
+# ============================================================================
+# LISTINGS
+# ============================================================================
+
+
+def _save_sandboxed_agent(db, agent_id: str = "sandboxed") -> None:
+    skills = Skills(loaders=[DbSkills(db, names=["greeter"])], executor=_SandboxExecutor())
+    Agent(id=agent_id, name=agent_id, db=db, skills=skills).save()
+
+
+def test_listing_shows_a_sandboxed_agent_without_its_skills(tmp_path):
+    """A listing shows degraded components: an agent saved under a non-default executor is
+    listed with its skills left off and marked, and a save of that listed object refuses
+    rather than erase the stored names and marker."""
+    db = _db_with_skill(tmp_path)
+    _save_sandboxed_agent(db)
+    stored = {"names": ["greeter"], "requires_executor": True}
+
+    for _ in range(2):
+        listed = {agent.id: agent for agent in get_agents(db)}
+        assert "sandboxed" in listed
+        agent = listed["sandboxed"]
+        assert agent.skills is None
+        assert agent._degraded_skills == stored
+        with pytest.raises(ValueError, match="skill_executor"):
+            agent.save()
+        assert db.get_config(component_id="sandboxed")["config"]["skills"] == stored
+
+
+def test_load_from_dict_and_dispatch_still_refuse_a_sandboxed_agent(tmp_path):
+    """Only a listing degrades: the default load, a direct from_dict and the dispatch helper
+    keep refusing to run a saved sandbox policy without its executor."""
+    from agno.os.utils import get_agent_by_id as dispatch_agent_by_id
+
+    db = _db_with_skill(tmp_path)
+    _save_sandboxed_agent(db)
+    config = db.get_config(component_id="sandboxed")["config"]
+
+    for _ in range(2):
+        with pytest.raises(ComponentRehydrationError, match="executor"):
+            Agent.load("sandboxed", db=db)
+        with pytest.raises(ComponentRehydrationError, match="executor"):
+            Agent.from_dict(config)
+        with pytest.raises(ComponentRehydrationError, match="executor"):
+            Agent.from_dict(config, db=db)
+        with pytest.raises(ComponentRehydrationError, match="executor"):
+            get_agent_by_id(db, "sandboxed")
+        with pytest.raises(ComponentRehydrationError, match="executor"):
+            dispatch_agent_by_id("sandboxed", agents=None, db=db)
+    assert db.get_config(component_id="sandboxed")["config"]["skills"] == {
+        "names": ["greeter"],
+        "requires_executor": True,
+    }

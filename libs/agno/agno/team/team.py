@@ -705,6 +705,8 @@ class Team:
         # Component metadata (set by get_teams during DB loading)
         self._version: Optional[int] = None
         self._stage: Optional[str] = None
+        # The saved skills block of a team a listing showed without its skills; save() refuses while set.
+        self._degraded_skills: Optional[Dict[str, Any]] = None
 
     @property
     def background_executor(self) -> Any:
@@ -2062,7 +2064,9 @@ def get_teams(
                         # per-version pin links are a detail-read concern.
                         # Resolve DB-backed members under the same owner scope as the team.
                         with component_owner_scope(user_id):
-                            team = Team.from_dict(team_config, db=db, registry=registry, strict=False)
+                            team = _storage.from_dict(
+                                Team, data=team_config, db=db, registry=registry, strict=False, for_listing=True
+                            )
                         team.id = component_id
                         team._version = component.get("current_version")
                         team._stage = config.get("stage")

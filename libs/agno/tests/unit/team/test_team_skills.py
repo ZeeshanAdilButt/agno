@@ -23,7 +23,7 @@ from agno.skills import DbSkills, LocalSkills, Skills
 from agno.skills.executor import SkillExecutor
 from agno.team._messages import aget_system_message, get_system_message
 from agno.team._tools import _determine_tools_for_model
-from agno.team.team import Team, get_team_by_id
+from agno.team.team import Team, get_team_by_id, get_teams
 
 SAMPLE_SKILLS_DIR = "cookbook/02_agents/16_skills/sample_skills"
 
@@ -694,3 +694,59 @@ def test_team_load_of_a_default_executor_team_is_unchanged(tmp_path):
 
     assert loaded is not None
     assert type(loaded.skills.executor) is LocalSkillExecutor
+
+
+# ============================================================================
+# LISTINGS
+# ============================================================================
+
+
+def _save_sandboxed_team(db, team_id: str = "sandboxed-team") -> None:
+    skills = Skills(loaders=[DbSkills(db, names=["greeter"])], executor=_TeamSandboxExecutor())
+    Team(id=team_id, name=team_id, members=[], db=db, skills=skills).save()
+
+
+def test_listing_shows_a_sandboxed_team_without_its_skills(tmp_path):
+    """Team twin: listed with its skills left off and marked; a save of the listed object
+    refuses rather than erase the stored names and marker."""
+    db = _make_db(tmp_path)
+    _create_skill_row(db, "greeter")
+    _save_sandboxed_team(db)
+    stored = {"names": ["greeter"], "requires_executor": True}
+
+    for _ in range(2):
+        listed = {team.id: team for team in get_teams(db)}
+        assert "sandboxed-team" in listed
+        team = listed["sandboxed-team"]
+        assert team.skills is None
+        assert team._degraded_skills == stored
+        with pytest.raises(ValueError, match="skill_executor"):
+            team.save()
+        assert db.get_config(component_id="sandboxed-team")["config"]["skills"] == stored
+
+
+def test_load_from_dict_and_dispatch_still_refuse_a_sandboxed_team(tmp_path):
+    """Team twin: the default load, a direct from_dict and the dispatch helper keep refusing."""
+    from agno.exceptions import ComponentRehydrationError
+    from agno.os.utils import get_team_by_id as dispatch_team_by_id
+
+    db = _make_db(tmp_path)
+    _create_skill_row(db, "greeter")
+    _save_sandboxed_team(db)
+    config = db.get_config(component_id="sandboxed-team")["config"]
+
+    for _ in range(2):
+        with pytest.raises(ComponentRehydrationError, match="executor"):
+            Team.load("sandboxed-team", db=db)
+        with pytest.raises(ComponentRehydrationError, match="executor"):
+            Team.from_dict(config)
+        with pytest.raises(ComponentRehydrationError, match="executor"):
+            Team.from_dict(config, db=db)
+        with pytest.raises(ComponentRehydrationError, match="executor"):
+            get_team_by_id(db, "sandboxed-team")
+        with pytest.raises(ComponentRehydrationError, match="executor"):
+            dispatch_team_by_id("sandboxed-team", teams=None, db=db)
+    assert db.get_config(component_id="sandboxed-team")["config"]["skills"] == {
+        "names": ["greeter"],
+        "requires_executor": True,
+    }

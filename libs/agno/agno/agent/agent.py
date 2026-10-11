@@ -612,6 +612,8 @@ class Agent:
         # Component metadata (set by get_agents during DB loading)
         self._version: Optional[int] = None
         self._stage: Optional[str] = None
+        # The saved skills block of an agent a listing showed without its skills; save() refuses while set.
+        self._degraded_skills: Optional[Dict[str, Any]] = None
 
         from agno.utils.callables import is_callable_factory
 
@@ -2017,7 +2019,9 @@ def get_agents(
                             agent_config["id"] = component_id
                         # Lenient on purpose: listings must show degraded
                         # components so they stay visible and fixable.
-                        agent = Agent.from_dict(agent_config, db=db, registry=registry, strict=False)
+                        agent = _storage.from_dict(
+                            Agent, data=agent_config, db=db, registry=registry, strict=False, for_listing=True
+                        )
                         agent.id = component_id
                         agent._version = component.get("current_version")
                         agent._stage = config.get("stage")

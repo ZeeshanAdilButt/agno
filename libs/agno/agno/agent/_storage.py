@@ -1252,6 +1252,7 @@ def from_dict(
     registry: Optional[Registry] = None,
     strict: bool = False,
     skill_executor: Optional["SkillExecutor"] = None,
+    for_listing: bool = False,
 ) -> Agent:
     """
     Create an agent from a dictionary.
@@ -1269,6 +1270,9 @@ def from_dict(
             unresolvable serialized db config warns and falls back to the
             caller's db in both modes. Pass False to reconstruct as much as
             possible, e.g. for listings that must show degraded components.
+        for_listing: True from a listing, which never runs scripts: a recorded executor
+            that is not supplied leaves the skills off and marks the component instead
+            of refusing, so the listing shows it; save() refuses such a component.
 
     Returns:
         Agent: Reconstructed agent instance
@@ -1454,6 +1458,7 @@ def from_dict(
 
     # --- Handle Skills reconstruction ---
     # Name references, re-resolved from the skills table like members by id.
+    degraded_skills: Optional[Dict[str, Any]] = None
     if "skills" in config and isinstance(config["skills"], dict):
         skill_names = config["skills"].get("names")
         # config["db"] is already live from the block above and owns this agent's skill rows,
@@ -1465,27 +1470,35 @@ def from_dict(
             from agno.skills import DbSkills, Skills
 
             # Refuse rather than fall back to the host executor: that would turn a sandbox
-            # policy into running scripts on this machine.
+            # policy into running scripts on this machine. A listing never runs scripts, so
+            # it shows the component without them, marked so a save cannot erase what is stored.
             if config["skills"].get("requires_executor") and skill_executor is None:
-                raise ComponentRehydrationError(
-                    "This was saved with a non-default skill executor, which cannot be serialized. "
-                    "Pass skill_executor= to load it; loading without one would run skill scripts "
-                    "on the host."
-                )
-            skills = Skills(loaders=[DbSkills(skills_db, names=skill_names)], executor=skill_executor)
-            if strict and not skills.has_unloaded_loaders():
-                # The eager load answered with the shared rows, so a name it did not return is
-                # either owned (resolved per request) or gone; one unscoped read tells which.
-                missing = [name for name in skill_names if skills.get_skill(name) is None]
-                if missing:
-                    stored = {row["name"] for row in skills_db.get_skills_with_content(names=missing)}
-                    missing = [name for name in missing if name not in stored]
-                if missing:
+                if not for_listing:
                     raise ComponentRehydrationError(
-                        f"{component_label} references skills {missing} which were not found in the skills "
-                        "table. Restore the rows, or pass strict=False to load without them."
+                        "This was saved with a non-default skill executor, which cannot be serialized. "
+                        "Pass skill_executor= to load it; loading without one would run skill scripts "
+                        "on the host."
                     )
-            config["skills"] = skills
+                log_warning(
+                    f"{component_label} is listed without its skills: it was saved with a non-default "
+                    "skill executor and none was supplied."
+                )
+                degraded_skills = config.pop("skills")
+            else:
+                skills = Skills(loaders=[DbSkills(skills_db, names=skill_names)], executor=skill_executor)
+                if strict and not skills.has_unloaded_loaders():
+                    # The eager load answered with the shared rows, so a name it did not return is
+                    # either owned (resolved per request) or gone; one unscoped read tells which.
+                    missing = [name for name in skill_names if skills.get_skill(name) is None]
+                    if missing:
+                        stored = {row["name"] for row in skills_db.get_skills_with_content(names=missing)}
+                        missing = [name for name in missing if name not in stored]
+                    if missing:
+                        raise ComponentRehydrationError(
+                            f"{component_label} references skills {missing} which were not found in the skills "
+                            "table. Restore the rows, or pass strict=False to load without them."
+                        )
+                config["skills"] = skills
         else:
             if skill_names:
                 if strict:
@@ -1525,7 +1538,7 @@ def from_dict(
     config.pop("team_id", None)
     config.pop("workflow_id", None)
 
-    return cls(
+    agent = cls(
         # --- Agent settings ---
         model=config.get("model"),
         name=config.get("name"),
@@ -1644,6 +1657,8 @@ def from_dict(
         debug_level=config.get("debug_level", 1),
         telemetry=config.get("telemetry", True),
     )
+    agent._degraded_skills = degraded_skills
+    return agent
 
 
 # ---------------------------------------------------------------------------
@@ -1672,6 +1687,11 @@ def save(
     Returns:
         Optional[int]: The version number of the saved config.
     """
+    if agent._degraded_skills is not None:
+        raise ValueError(
+            f"Agent '{agent.id}' was listed without its skills: it was saved with a non-default "
+            "skill executor and none was supplied. Load it with skill_executor= before saving."
+        )
     db_ = db or agent.db
     if not db_:
         raise ValueError("Db not initialized or provided")

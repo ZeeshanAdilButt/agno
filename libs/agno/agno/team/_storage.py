@@ -1356,8 +1356,8 @@ def from_dict(
                 if strict and isinstance(skills_db, AsyncBaseDb):
                     raise ComponentRehydrationError(
                         f"{component_label} references skills {skill_names}, which a strict load cannot "
-                        "check against an async database. Pass a sync db=, or strict=False to load "
-                        "without the check."
+                        "check against an async database. Use a sync database, or pass strict=False to "
+                        "load the component without the check."
                     )
                 skills = Skills(
                     loaders=[DbSkills(skills_db, names=skill_names)], executor=skill_executor, lazy=for_listing

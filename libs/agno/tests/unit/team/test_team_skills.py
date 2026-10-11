@@ -857,3 +857,103 @@ def test_first_save_with_an_unloaded_all_rows_loader_round_trips(tmp_path):
         loaded = Team.load("all-rows", db=sync_db)
         assert loaded is not None and loaded.skills is not None
         assert loaded.skills.get_skill_names() == ["greeter"]
+
+
+# ============================================================================
+# THE ALL MARKER ON THE LISTING, DEGRADED AND STRICT PATHS
+# ============================================================================
+
+
+def test_listing_builds_an_all_rows_loader_without_reading_and_a_resave_keeps_the_marker(tmp_path, monkeypatch):
+    """A listed all-rows team reads nothing, serializes the marker from configuration alone, a
+    save from the listing keeps it, and the first use reads every row."""
+    from agno.db.sqlite import SqliteDb
+
+    db = _make_db(tmp_path)
+    _create_skill_row(db, "release-notes")
+    Team(id="all-rows", name="all-rows", members=[], db=db, skills=Skills(loaders=[DbSkills(db)])).save()
+    reads = []
+    original = SqliteDb.get_skills_with_content
+
+    def counting(self, *args, **kwargs):
+        reads.append(kwargs.get("names"))
+        return original(self, *args, **kwargs)
+
+    monkeypatch.setattr(SqliteDb, "get_skills_with_content", counting)
+    for _ in range(2):
+        reads.clear()
+        listed = next(team for team in get_teams(db) if team.id == "all-rows")
+        assert reads == []
+        assert listed.skills is not None and listed.skills.has_unloaded_loaders()
+        assert listed.to_dict()["skills"] == {"all": True}
+        listed.save()
+        assert db.get_config(component_id="all-rows")["config"]["skills"] == {"all": True}
+    _create_skill_row(db, "added-later")
+    snippet = listed.skills.get_system_prompt_snippet()
+    assert "release-notes" in snippet and "added-later" in snippet
+
+
+def test_listing_shows_a_sandboxed_all_rows_team_without_its_skills(tmp_path):
+    """The degraded marker holds for the all shape: listed without skills, a save refuses, and the
+    stored block keeps both the marker and the executor requirement."""
+    db = _make_db(tmp_path)
+    _create_skill_row(db, "release-notes")
+    skills = Skills(loaders=[DbSkills(db)], executor=_TeamSandboxExecutor())
+    Team(id="sandboxed", name="sandboxed", members=[], db=db, skills=skills).save()
+    stored = {"all": True, "requires_executor": True}
+    assert db.get_config(component_id="sandboxed")["config"]["skills"] == stored
+
+    for _ in range(2):
+        listed = next(team for team in get_teams(db) if team.id == "sandboxed")
+        assert listed.skills is None
+        with pytest.raises(ValueError, match="listed without its skills"):
+            listed.save()
+        assert db.get_config(component_id="sandboxed")["config"]["skills"] == stored
+        with pytest.raises(ComponentRehydrationError, match="executor"):
+            Team.load("sandboxed", db=db)
+        loaded = Team.load("sandboxed", db=db, skill_executor=_TeamSandboxExecutor())
+        assert loaded.skills.get_skill_names() == ["release-notes"]
+
+
+async def test_strict_load_of_the_all_shape_on_an_async_db_reads_on_the_first_async_prompt(tmp_path):
+    """Strict verifies saved names, which a sync load cannot read from an async database; the all
+    marker names nothing, so strict has nothing to refuse and the first async prompt reads every row."""
+    _, async_db = _async_skills_dbs(tmp_path)
+
+    for _ in range(2):
+        loaded = Team.from_dict({"name": "t", "skills": {"all": True}}, db=async_db, strict=True)
+        assert loaded.skills is not None and loaded.skills.has_unloaded_loaders()
+        assert "greeter" in await loaded.skills.aget_system_prompt_snippet()
+        assert loaded.skills.get_skill_names() == ["greeter"]
+
+
+def test_the_all_shape_with_no_db_is_dropped_leniently_and_refused_strictly(monkeypatch):
+    """The marker with nothing to resolve it against: dropped with a warning that names all
+    skills, refused strictly."""
+    warnings: List[str] = []
+    monkeypatch.setattr("agno.team._storage.log_warning", warnings.append)
+
+    for _ in range(2):
+        assert Team.from_dict({"name": "t", "skills": {"all": True}}).skills is None
+        with pytest.raises(ComponentRehydrationError, match="all skills"):
+            Team.from_dict({"name": "t", "skills": {"all": True}}, strict=True)
+    assert any("all skills" in w for w in warnings)
+
+
+def test_a_reloaded_all_rows_team_resolves_each_users_own_rows(tmp_path):
+    """After a load the marker resolves per user: alice's prompt carries alice's row and not
+    bob's, the shared mapping holds the shared row only, and a resave keeps the marker."""
+    db = _make_db(tmp_path)
+    db.create_skill({"name": "alice-skill", "description": "d", "instructions": "i", "user_id": "alice"})
+    db.create_skill({"name": "bob-skill", "description": "d", "instructions": "i", "user_id": "bob"})
+    db.create_skill({"name": "shared-skill", "description": "d", "instructions": "i"})
+    Team(name="scoped", id="scoped", members=[], db=db, skills=Skills(loaders=[DbSkills(db)])).save()
+
+    for _ in range(2):
+        loaded = Team.load("scoped", db=db)
+        assert loaded.skills.get_skill_names() == ["shared-skill"]
+        alice = loaded.skills.get_system_prompt_snippet(user_id="alice")
+        assert "alice-skill" in alice and "bob-skill" not in alice
+        bob = loaded.skills.get_system_prompt_snippet(user_id="bob")
+        assert "bob-skill" in bob and "alice-skill" not in bob
+        assert loaded.to_dict()["skills"] == {"all": True}

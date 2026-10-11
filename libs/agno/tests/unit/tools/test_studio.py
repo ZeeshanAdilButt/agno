@@ -3887,6 +3887,28 @@ class TestEditPreservation:
             studio._preserve_unresolved_keys("skills-agent", config, replaced_keys=set())
             assert config["skills"] == {"names": ["release-notes"]}
 
+    def test_description_edit_preserves_an_all_rows_skills_block(self, tmp_path):
+        """The all-rows marker passes through an edit unchanged and still resolves a row created later."""
+        from agno.skills import DbSkills, Skills
+
+        db = SqliteDb(db_file=str(tmp_path / "preserve_all_skills.db"))
+        db.create_skill({"name": "release-notes", "description": "Draft release notes", "instructions": "i"})
+        Agent(id="skills-agent", name="S", model=OpenAIResponses(id="gpt-5.5"), skills=Skills([DbSkills(db)])).save(
+            db=db
+        )
+
+        studio = StudioTools(registry=Registry(), db=db)
+        for round_number in (1, 2):
+            out = _loads(studio.edit_agent("skills-agent", description=f"edited {round_number}"))
+            assert out.get("status") == "edited"
+            row = db.get_config(component_id="skills-agent", version=_edit_version(out))
+            assert row["config"]["skills"] == {"all": True}
+        # Only a resolved marker shows a row created after the edits.
+        db.create_skill({"name": "added-later", "description": "d", "instructions": "i"})
+        loaded = Agent.load("skills-agent", db=db)
+        assert loaded is not None and loaded.skills is not None
+        assert sorted(loaded.skills.get_skill_names()) == ["added-later", "release-notes"]
+
     @pytest.mark.asyncio
     async def test_async_description_edit_preserves_unresolved_memory_manager(self, tmp_path):
         from agno.memory.manager import MemoryManager

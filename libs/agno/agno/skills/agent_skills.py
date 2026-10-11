@@ -1,10 +1,12 @@
-import itertools
+import asyncio
 import json
 import subprocess
+import threading
 from collections import OrderedDict
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from typing import Dict, List, Literal, Optional
+from typing import Any, Callable, Dict, List, Literal, Optional
+from weakref import WeakKeyDictionary
 
 from agno.exceptions import PathSecurityError
 from agno.run.base import RunContext
@@ -64,11 +66,12 @@ class Skills:
         self._loader_results: Dict[int, List[Skill]] = {}
         # One view per user from owner-scoped refreshes, newest last, kept apart from _skills.
         self._user_skills: "OrderedDict[str, Dict[str, Skill]]" = OrderedDict()
-        # Refreshes are numbered as they start; a view (None is the shared mapping) records
-        # the number it last committed, so a refresh that read before a newer one committed
-        # does not write over it.
-        self._refresh_generations = itertools.count(1)
-        self._committed_generations: Dict[Optional[str], int] = {}
+        # One lock per view (None is the shared mapping) and per kind: sync refreshes of one view
+        # take turns, async ones do too, so an older read never lands over a newer one, while
+        # other users' refreshes run alongside. Bounded like the views, newest last; the async
+        # locks are kept per event loop, which an asyncio.Lock binds to on first use.
+        self._refresh_locks: "OrderedDict[Optional[str], threading.Lock]" = OrderedDict()
+        self._async_refresh_locks: "WeakKeyDictionary[asyncio.AbstractEventLoop, OrderedDict[Optional[str], asyncio.Lock]]" = WeakKeyDictionary()
         self._warned_unsaved_skills = False
         if not lazy:
             self._load_skills()
@@ -116,30 +119,31 @@ class Skills:
 
         Any failure keeps the previous state, so a request mid-outage serves the last loaded skills.
         """
-        generation = next(self._refresh_generations)
-        fresh: Dict[int, List[Skill]] = {}
-        # The shared rows of a loader the shared mapping never loaded, read alongside the
-        # user's: the eager load cannot await an async database, and under user-only
-        # traffic nothing else would fill what saves and strict loads read.
-        shared: Dict[int, List[Skill]] = {}
-        for index, loader in enumerate(self.loaders):
-            if not loader.refresh_per_request:
-                continue
-            try:
-                # Only owner-scoped loaders receive the user; the rest are called with no user.
-                fresh[index] = loader.load(user_id=user_id) if loader.owner_scoped else loader.load()
-                if user_id is not None and index not in self._loader_results:
-                    shared[index] = loader.load() if loader.owner_scoped else fresh[index]
-            except Exception as e:
-                log_warning(f"Error refreshing skills from {loader}, keeping the last loaded skills: {str(e)}")
+        if not any(loader.refresh_per_request for loader in self.loaders):
+            return
+        with self._refresh_lock(self._refresh_locks, user_id, threading.Lock):
+            fresh: Dict[int, List[Skill]] = {}
+            # The shared rows of a loader the shared mapping never loaded, read alongside the
+            # user's: the eager load cannot await an async database, and under user-only
+            # traffic nothing else would fill what saves and strict loads read.
+            shared: Dict[int, List[Skill]] = {}
+            for index, loader in enumerate(self.loaders):
+                if not loader.refresh_per_request:
+                    continue
+                try:
+                    # Only owner-scoped loaders receive the user; the rest are called with no user.
+                    fresh[index] = loader.load(user_id=user_id) if loader.owner_scoped else loader.load()
+                    if user_id is not None and index not in self._loader_results:
+                        shared[index] = loader.load() if loader.owner_scoped else fresh[index]
+                except Exception as e:
+                    log_warning(f"Error refreshing skills from {loader}, keeping the last loaded skills: {str(e)}")
 
-        if fresh:
-            self._commit_refresh(user_id, generation, fresh, shared)
+            if fresh:
+                self._commit_refresh(user_id, fresh, shared)
 
     def _commit_refresh(
         self,
         user_id: Optional[str],
-        generation: int,
         fresh: Dict[int, List[Skill]],
         shared: Dict[int, List[Skill]],
     ) -> None:
@@ -148,15 +152,12 @@ class Skills:
         Assembled here, after every read, so a sibling that committed meanwhile is built on,
         not rolled back.
         """
-        if self._committed_generations.get(user_id, 0) > generation:
-            return
         results = {**self._loader_results, **fresh}
         try:
             merged = self._merge_loader_results(results)
         except SkillError as e:
             log_warning(f"Error refreshing skills, keeping the last loaded skills: {str(e)}")
             return
-        self._committed_generations[user_id] = generation
         if user_id is None:
             self._loader_results = results
             self._skills = merged
@@ -170,8 +171,7 @@ class Skills:
         self._user_skills[user_id] = merged
         self._user_skills.move_to_end(user_id)
         while len(self._user_skills) > _USER_VIEWS_KEPT:
-            evicted, _ = self._user_skills.popitem(last=False)
-            self._committed_generations.pop(evicted, None)
+            self._user_skills.popitem(last=False)
 
     def _view_for(self, user_id: Optional[str]) -> Dict[str, Skill]:
         """The mapping a request reads: the user's own view, else the shared mapping."""
@@ -191,23 +191,36 @@ class Skills:
             self._refresh_loaders(user_id=user_id)
         return self._view_for(user_id)
 
+    @staticmethod
+    def _refresh_lock(locks: "OrderedDict[Optional[str], Any]", user_id: Optional[str], make: Callable[[], Any]) -> Any:
+        """The view's lock from a bounded map: the oldest is dropped past the view bound, and a
+        refresh still holding a dropped lock keeps its own."""
+        lock = locks.setdefault(user_id, make())
+        locks.move_to_end(user_id)
+        while len(locks) > _USER_VIEWS_KEPT + 1:
+            locks.popitem(last=False)
+        return lock
+
     async def _arefresh_loaders(self, user_id: Optional[str] = None) -> None:
         """Async twin of _refresh_loaders: awaits each refreshing loader's aload."""
-        generation = next(self._refresh_generations)
-        fresh: Dict[int, List[Skill]] = {}
-        shared: Dict[int, List[Skill]] = {}
-        for index, loader in enumerate(self.loaders):
-            if not loader.refresh_per_request:
-                continue
-            try:
-                fresh[index] = await loader.aload(user_id=user_id) if loader.owner_scoped else await loader.aload()
-                if user_id is not None and index not in self._loader_results:
-                    shared[index] = await loader.aload() if loader.owner_scoped else fresh[index]
-            except Exception as e:
-                log_warning(f"Error refreshing skills from {loader}, keeping the last loaded skills: {str(e)}")
+        if not any(loader.refresh_per_request for loader in self.loaders):
+            return
+        loop_locks = self._async_refresh_locks.setdefault(asyncio.get_running_loop(), OrderedDict())
+        async with self._refresh_lock(loop_locks, user_id, asyncio.Lock):
+            fresh: Dict[int, List[Skill]] = {}
+            shared: Dict[int, List[Skill]] = {}
+            for index, loader in enumerate(self.loaders):
+                if not loader.refresh_per_request:
+                    continue
+                try:
+                    fresh[index] = await loader.aload(user_id=user_id) if loader.owner_scoped else await loader.aload()
+                    if user_id is not None and index not in self._loader_results:
+                        shared[index] = await loader.aload() if loader.owner_scoped else fresh[index]
+                except Exception as e:
+                    log_warning(f"Error refreshing skills from {loader}, keeping the last loaded skills: {str(e)}")
 
-        if fresh:
-            self._commit_refresh(user_id, generation, fresh, shared)
+            if fresh:
+                self._commit_refresh(user_id, fresh, shared)
 
     def reload(self) -> None:
         """Reload skills from all loaders, replacing the existing skills.

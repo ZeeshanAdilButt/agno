@@ -1514,19 +1514,59 @@ class StaleReadLoader(SkillLoader):
         return rows
 
 
-async def test_a_users_older_refresh_does_not_write_over_a_newer_one() -> None:
-    """Same user, two overlapping refreshes: the one that read first but commits last is dropped,
-    so the view keeps what the later prompt advertised."""
+async def test_refreshes_of_one_view_take_turns_while_other_views_run() -> None:
+    """One lock per view: a second refresh for the same user waits for the first, another user's
+    refresh does not, and the view ends with what the later refresh read."""
     loader = StaleReadLoader()
     skills = Skills(loaders=[loader])
 
     for _ in range(2):
         loader.rows, loader.parked, loader.release = [_row("old-skill")], False, asyncio.Event()
         older = asyncio.create_task(skills.aget_system_prompt_snippet(user_id="alice"))
-        await asyncio.sleep(0)  # the older refresh has read old-skill and is parked
+        await asyncio.sleep(0)  # the older refresh has read old-skill and holds alice's lock
         loader.rows = [_row("new-skill")]
-        assert "new-skill" in await asyncio.wait_for(skills.aget_system_prompt_snippet(user_id="alice"), timeout=1)
+        newer = asyncio.create_task(skills.aget_system_prompt_snippet(user_id="alice"))
+        await asyncio.sleep(0)
+        assert not newer.done()  # waiting on alice's lock
+        assert "new-skill" in await asyncio.wait_for(skills.aget_system_prompt_snippet(user_id="bob"), timeout=1)
+
         loader.release.set()
         await older
+        await newer
         assert list(skills._view_for("alice")) == ["new-skill"]
         assert skills.get_skill_names() == ["old-skill"]
+
+
+def test_refresh_locks_do_not_grow_with_users(sample_skill: Skill) -> None:
+    """A loader that never refreshes takes no lock, and a refresh that commits nothing (a failed
+    read) leaves no more locks behind than views are kept."""
+    from agno.skills.agent_skills import _USER_VIEWS_KEPT
+
+    plain = Skills(loaders=[MockSkillLoader([sample_skill])])
+    for n in range(300):
+        plain.get_system_prompt_snippet(user_id=f"user-{n}")
+    assert plain._refresh_locks == {}
+
+    failing = RefreshingLoader([sample_skill])
+    failing.fail = True
+    down = Skills(loaders=[failing])
+    for n in range(300):
+        down.get_system_prompt_snippet(user_id=f"user-{n}")
+    assert len(down._refresh_locks) <= _USER_VIEWS_KEPT + 1
+
+
+async def test_async_refresh_locks_do_not_grow_with_users(sample_skill: Skill) -> None:
+    """Async twin of test_refresh_locks_do_not_grow_with_users."""
+    from agno.skills.agent_skills import _USER_VIEWS_KEPT
+
+    plain = Skills(loaders=[MockSkillLoader([sample_skill])])
+    for n in range(300):
+        await plain.aget_system_prompt_snippet(user_id=f"user-{n}")
+    assert all(not locks for locks in plain._async_refresh_locks.values())
+
+    failing = AsyncRefreshingLoader([sample_skill])
+    failing.fail = True
+    down = Skills(loaders=[failing])
+    for n in range(300):
+        await down.aget_system_prompt_snippet(user_id=f"user-{n}")
+    assert all(len(locks) <= _USER_VIEWS_KEPT + 1 for locks in down._async_refresh_locks.values())

@@ -39,9 +39,9 @@ class Skills:
             instead of raising mid-request.
         executor: Runs a skill's scripts. Defaults to LocalSkillExecutor, which runs them as
             subprocesses on this host.
-        load: Whether to read every loader now. False builds the object with its loaders
-            unread, for a listing that only needs their configured names; reload() reads
-            them, as does the first per-request refresh for the loaders marked for it.
+        lazy: Build with the loaders unread, for a listing that only needs their configured
+            names; reload() reads them, as does the first per-request refresh for the
+            loaders marked for it.
     """
 
     def __init__(
@@ -50,7 +50,7 @@ class Skills:
         on_duplicate: Literal["warn", "raise"] = "warn",
         executor: Optional[SkillExecutor] = None,
         *,
-        load: bool = True,
+        lazy: bool = False,
     ):
         if on_duplicate not in ("warn", "raise"):
             raise ValueError(f"Invalid on_duplicate {on_duplicate!r}: expected 'warn' or 'raise'")
@@ -70,7 +70,7 @@ class Skills:
         self._refresh_generations = itertools.count(1)
         self._committed_generations: Dict[Optional[str], int] = {}
         self._warned_unsaved_skills = False
-        if load:
+        if not lazy:
             self._load_skills()
 
     def _load_skills(self) -> None:

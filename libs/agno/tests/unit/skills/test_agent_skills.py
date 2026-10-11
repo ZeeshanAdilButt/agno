@@ -1347,10 +1347,10 @@ def test_skill_tool_schemas_are_unchanged(mock_loader: MockSkillLoader) -> None:
 
 
 def test_skills_can_be_built_without_the_initial_load(sample_skill: Skill) -> None:
-    """A listing only needs the configured names: load=False builds the object with its loaders
+    """A listing only needs the configured names: lazy=True builds the object with its loaders
     unread, reports them unloaded, and reads them on the first refresh or reload()."""
     loader = RefreshingLoader([sample_skill])
-    skills = Skills(loaders=[loader], load=False)
+    skills = Skills(loaders=[loader], lazy=True)
     assert skills.has_unloaded_loaders() and skills.get_skill_names() == [] and loader.load_count == 0
 
     assert "test-skill" in skills.get_system_prompt_snippet()

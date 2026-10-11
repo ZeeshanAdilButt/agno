@@ -1360,7 +1360,7 @@ def from_dict(
                         "without the check."
                     )
                 skills = Skills(
-                    loaders=[DbSkills(skills_db, names=skill_names)], executor=skill_executor, load=not for_listing
+                    loaders=[DbSkills(skills_db, names=skill_names)], executor=skill_executor, lazy=for_listing
                 )
                 if strict and not skills.has_unloaded_loaders():
                     # The eager load answered with the shared rows, so a name it did not return is

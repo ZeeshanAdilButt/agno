@@ -310,6 +310,26 @@ class Skills:
                         names.append(name)
         return names
 
+    def to_config(self) -> Optional[Dict[str, Any]]:
+        """The skills block a stored agent or team saves, or None when nothing resolves from the table."""
+        from agno.skills.loaders.db import DbSkills
+
+        names = self.get_skills_from_db()
+        config: Dict[str, Any] = {}
+        if any(isinstance(loader, DbSkills) and loader.names is None for loader in self.loaders):
+            # A marker, not names: names would freeze the rows present at save time, and an
+            # async database has none loaded before its first request.
+            config["all"] = True
+        elif names:
+            config["names"] = names
+        else:
+            return None
+        # An executor cannot be serialized: record that one was configured, so a load without
+        # it refuses rather than run scripts on the host.
+        if type(self.executor) is not LocalSkillExecutor:
+            config["requires_executor"] = True
+        return config
+
     def get_system_prompt_snippet(self, user_id: Optional[str] = None) -> str:
         """Generate a system prompt snippet with available skills metadata.
 

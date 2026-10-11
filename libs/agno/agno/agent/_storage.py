@@ -994,17 +994,11 @@ def to_dict(agent: Agent) -> Dict[str, Any]:
         config["references_format"] = agent.references_format
 
     # --- Skills ---
-    # Name references, re-resolved from the skills table on load; saving freezes the names.
+    # Name references (or the all-rows marker), re-resolved from the skills table on load.
     if agent.skills is not None:
-        skill_names = agent.skills.get_skills_from_db()
-        if skill_names:
-            config["skills"] = {"names": skill_names}
-            # An executor cannot be serialized: record that one was configured, so a load
-            # without it refuses rather than run scripts on the host.
-            from agno.skills.executor import LocalSkillExecutor
-
-            if type(agent.skills.executor) is not LocalSkillExecutor:
-                config["skills"]["requires_executor"] = True
+        skills_config = agent.skills.to_config()
+        if skills_config:
+            config["skills"] = skills_config
         else:
             log_debug("Agent skills hold no skills to reference; skills will not be saved.")
 
@@ -1460,13 +1454,15 @@ def from_dict(
     # Name references, re-resolved from the skills table like members by id.
     degraded_skills: Optional[Dict[str, Any]] = None
     if "skills" in config and isinstance(config["skills"], dict):
-        skill_names = config["skills"].get("names")
+        # "all" loads every row; names would freeze the set at save time.
+        load_all = config["skills"].get("all") is True
+        skill_names = None if load_all else config["skills"].get("names")
         # config["db"] is already live from the block above and owns this agent's skill rows,
         # custom skills_table included, when its backend has a skills table; the caller's db
         # covers a config whose db is missing, could not be rebuilt, or cannot read skills.
         config_db = config.get("db")
         skills_db = config_db if config_db is not None and _db_reads_skills(config_db) else db
-        if skill_names and skills_db is not None:
+        if (load_all or skill_names) and skills_db is not None:
             from agno.skills import DbSkills, Skills
 
             # Refuse rather than fall back to the host executor: that would turn a sandbox
@@ -1486,8 +1482,9 @@ def from_dict(
                 degraded_skills = config.pop("skills")
             else:
                 # The sync load cannot read an async database, so the strict check of the saved
-                # names could not run: refuse rather than load them unverified.
-                if strict and isinstance(skills_db, AsyncBaseDb):
+                # names could not run: refuse rather than load them unverified. The all marker
+                # names nothing to check, so it loads and reads on the first async request.
+                if strict and skill_names and isinstance(skills_db, AsyncBaseDb):
                     raise ComponentRehydrationError(
                         f"{component_label} references skills {skill_names}, which a strict load cannot "
                         "check against an async database. Use a sync database, or pass strict=False to "
@@ -1496,7 +1493,7 @@ def from_dict(
                 skills = Skills(
                     loaders=[DbSkills(skills_db, names=skill_names)], executor=skill_executor, lazy=for_listing
                 )
-                if strict and not skills.has_unloaded_loaders():
+                if strict and skill_names and not skills.has_unloaded_loaders():
                     # The eager load answered with the shared rows, so a name it did not return is
                     # either owned (resolved per request) or gone; one unscoped read tells which.
                     missing = [name for name in skill_names if skills.get_skill(name) is None]
@@ -1510,13 +1507,14 @@ def from_dict(
                         )
                 config["skills"] = skills
         else:
-            if skill_names:
+            if load_all or skill_names:
+                referenced = "all skills" if load_all else f"skills {skill_names}"
                 if strict:
                     raise ComponentRehydrationError(
-                        f"{component_label} references skills {skill_names} but has no db to resolve them. "
+                        f"{component_label} references {referenced} but has no db to resolve them. "
                         "Pass db=, or strict=False to load without them."
                     )
-                log_warning(f"No db provided, skills {skill_names} will not be resolved.")
+                log_warning(f"No db provided, {referenced} will not be resolved.")
             del config["skills"]
 
     # --- Handle CompressionManager reconstruction ---
@@ -1721,23 +1719,10 @@ def save(
             metadata=getattr(agent, "metadata", None),
         )
 
-        agent_config = to_dict(agent)
-        # A loader that never loaded serializes nothing, so saving would erase the stored
-        # names; merge them back until every loader has loaded.
-        if agent.skills is not None and agent.skills.has_unloaded_loaders():
-            prior = db_.get_config(component_id=agent.id)
-            prior_skills = (prior.get("config") or {}).get("skills") if prior else None
-            prior_names = prior_skills.get("names") if isinstance(prior_skills, dict) else None
-            if prior_names:
-                current_names = agent_config.get("skills", {}).get("names", [])
-                merged = list(current_names) + [name for name in prior_names if name not in current_names]
-                agent_config["skills"] = {"names": merged}
-                log_warning("Agent skills have not fully loaded; preserving the previously saved skill names.")
-
         # Create or update config
         config = db_.upsert_config(
             component_id=agent.id,
-            config=agent_config,
+            config=to_dict(agent),
             label=label,
             stage=stage,
             notes=notes,

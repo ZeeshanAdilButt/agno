@@ -1,6 +1,7 @@
 """Unit tests for Skills orchestrator class."""
 
 import asyncio
+import copy
 import json
 import logging
 import threading
@@ -1892,3 +1893,20 @@ async def test_a_sync_refresh_on_the_loop_does_not_wait_behind_a_workers_read() 
             assert list(skills._view_for("alice")) == ["new-skill"]
     finally:
         beat.cancel()
+
+
+def test_a_copied_skills_object_gets_a_lock_of_its_own(sample_skill: Skill, minimal_skill: Skill) -> None:
+    """A lock cannot be copied, so a deep copy of a Skills object, after refreshes on either
+    path, gets its own lock and its own bookkeeping; the two then refresh apart."""
+    loader = RefreshingLoader([sample_skill])
+    skills = Skills(loaders=[loader])
+    skills.get_system_prompt_snippet(user_id="alice")
+
+    for _ in range(2):
+        copied = copy.deepcopy(skills)
+        assert copied._refresh_lock is not skills._refresh_lock
+        assert list(copied._view_for("alice")) == ["test-skill"]
+        copied.loaders[0]._skills = [minimal_skill]
+        assert "minimal-skill" in copied.get_system_prompt_snippet(user_id="alice")
+        assert list(skills._view_for("alice")) == ["test-skill"]
+        assert "test-skill" in skills.get_system_prompt_snippet(user_id="alice")

@@ -4,7 +4,7 @@ import threading
 from collections import OrderedDict
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from typing import Dict, List, Literal, Optional
+from typing import Any, Dict, List, Literal, Optional
 
 from agno.exceptions import PathSecurityError
 from agno.run.base import RunContext
@@ -73,6 +73,16 @@ class Skills:
         self._warned_unsaved_skills = False
         if not lazy:
             self._load_skills()
+
+    def __getstate__(self) -> Dict[str, Any]:
+        # A lock cannot be copied or pickled; a copy gets a lock of its own.
+        state = self.__dict__.copy()
+        state.pop("_refresh_lock", None)
+        return state
+
+    def __setstate__(self, state: Dict[str, Any]) -> None:
+        self.__dict__.update(state)
+        self._refresh_lock = threading.Lock()
 
     def _load_skills(self) -> None:
         """Load skills from all loaders, replacing the current mapping in one step.

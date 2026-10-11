@@ -23,7 +23,6 @@ from agno.os.settings import AgnoAPISettings
 from agno.os.utils import get_db
 from agno.remote.base import RemoteDb
 from agno.skills.errors import SkillError, SkillValidationError
-from agno.skills.validator import validate_metadata
 
 logger = logging.getLogger(__name__)
 
@@ -136,8 +135,6 @@ def _attach_routes(router: APIRouter, dbs: dict[str, list[Union[BaseDb, AsyncBas
         if isinstance(db, RemoteDb):
             raise HTTPException(status_code=501, detail="Skills endpoints not supported on remote DBs")
 
-        _validate_skill_metadata(body.model_dump())
-
         try:
             if isinstance(db, AsyncBaseDb):
                 created = await db.create_skill(body.model_dump())
@@ -146,7 +143,8 @@ def _attach_routes(router: APIRouter, dbs: dict[str, list[Union[BaseDb, AsyncBas
         except NotImplementedError:
             raise HTTPException(status_code=501, detail=_UNSUPPORTED_DB)
         except SkillValidationError as e:
-            raise HTTPException(status_code=422, detail=str(e))
+            # Not str(e): with several errors it prefixes a count.
+            raise HTTPException(status_code=422, detail="; ".join(e.errors))
         except SkillError as e:
             # create_skill turns the duplicate-name integrity error into a SkillError
             raise HTTPException(status_code=409, detail=str(e))
@@ -210,8 +208,6 @@ def _attach_routes(router: APIRouter, dbs: dict[str, list[Union[BaseDb, AsyncBas
                     status_code=422,
                     detail=f"{field} cannot be null; omit the field to leave it unchanged",
                 )
-        _validate_skill_metadata({**existing, **updates})
-
         try:
             # A predicate on which row may be written, sent only when it scopes: checking the
             # fetched row and then writing unscoped would be a TOCTOU, since a name can be re-owned.
@@ -223,7 +219,8 @@ def _attach_routes(router: APIRouter, dbs: dict[str, list[Union[BaseDb, AsyncBas
         except NotImplementedError:
             raise HTTPException(status_code=501, detail=_UNSUPPORTED_DB)
         except SkillValidationError as e:
-            raise HTTPException(status_code=422, detail=str(e))
+            # Not str(e): with several errors it prefixes a count.
+            raise HTTPException(status_code=422, detail="; ".join(e.errors))
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"Failed to update skill: {e}")
 
@@ -288,26 +285,6 @@ def _attach_routes(router: APIRouter, dbs: dict[str, list[Union[BaseDb, AsyncBas
             raise HTTPException(status_code=404, detail="Skill not found")
 
     return router
-
-
-def _validate_skill_metadata(skill_data: dict) -> None:
-    """Reject metadata the loader would refuse, before the write.
-
-    The DB layer refuses it too; checking here keeps the 422 detail a plain "; "-joined list
-    rather than the exception text with its count prefix.
-    """
-    fields = {
-        "name": skill_data.get("name"),
-        "description": skill_data.get("description"),
-        "license": skill_data.get("license"),
-        "compatibility": skill_data.get("compatibility"),
-        "allowed-tools": skill_data.get("allowed_tools"),
-        "metadata": skill_data.get("metadata"),
-    }
-    # Unset optionals are omitted, not passed as None: the validator checks presence.
-    errors = validate_metadata({key: value for key, value in fields.items() if value is not None})
-    if errors:
-        raise HTTPException(status_code=422, detail="; ".join(errors))
 
 
 async def _fetch_skill(db: Union[BaseDb, AsyncBaseDb, RemoteDb], name: str, user_id: Optional[str] = None) -> dict:

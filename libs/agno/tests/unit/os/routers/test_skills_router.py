@@ -363,17 +363,23 @@ class TestWriteValidation:
 
     A row that fails validation makes the loader raise on every load and refresh, so a
     single bad row disables skills for every agent -- including the valid rows alongside
-    it. Mirrors how the schedules router validates the cron expression before the insert.
+    it. The database layer runs the one check before the insert; the router formats its list.
     """
 
     @pytest.mark.parametrize(
         "bad_name",
         ["Bad/Name", "UPPERCASE", "has spaces", "trailing-"],
     )
-    def test_create_rejects_an_invalid_skill_name(self, client, mock_db, bad_name):
-        resp = client.post("/skills", json=_create_body(name=bad_name))
+    def test_create_rejects_an_invalid_skill_name(self, tmp_path, settings, bad_name):
+        client, db = _real_client(tmp_path, settings)
+        body = _create_body(name=bad_name)
+        resp = client.post("/skills", json=body)
         assert resp.status_code == 422
-        mock_db.create_skill.assert_not_called()
+        # The detail is the database layer's own error list, joined.
+        with pytest.raises(SkillValidationError) as raised:
+            db.create_skill(dict(body))
+        assert resp.json()["detail"] == "; ".join(raised.value.errors)
+        assert db.get_skills()[1] == 0
 
     def test_create_rejects_invalid_metadata_value(self, client, mock_db):
         resp = client.post("/skills", json=_create_body(metadata="not-a-dict"))
@@ -385,17 +391,39 @@ class TestWriteValidation:
         assert resp.status_code == 201
         mock_db.create_skill.assert_called_once()
 
-    def test_update_rejects_an_invalid_description(self, client, mock_db):
-        mock_db.get_skill = MagicMock(return_value=_make_skill_row(version=1))
+    def test_update_rejects_an_invalid_description(self, tmp_path, settings):
+        client, db = _real_client(tmp_path, settings)
+        db.create_skill({"name": "demo-skill", "description": "d", "instructions": "i"})
         resp = client.patch("/skills/demo-skill", json={"version": 1, "description": ""})
         assert resp.status_code == 422
-        mock_db.update_skill.assert_not_called()
+        with pytest.raises(SkillValidationError) as raised:
+            db.update_skill("demo-skill", expected_version=1, description="")
+        assert resp.json()["detail"] == "; ".join(raised.value.errors)
+        stored = db.get_skill("demo-skill")
+        assert stored["version"] == 1 and stored["description"] == "d"
 
     def test_update_still_accepts_a_valid_change(self, client, mock_db):
         mock_db.get_skill = MagicMock(return_value=_make_skill_row(version=1))
         mock_db.update_skill = MagicMock(return_value=_make_skill_row(version=2, description="new"))
         resp = client.patch("/skills/demo-skill", json={"version": 1, "description": "new"})
         assert resp.status_code == 200
+
+    def test_create_formats_the_db_layers_list(self, client, mock_db):
+        mock_db.create_skill = MagicMock(
+            side_effect=SkillValidationError("Skill validation failed for 'demo-skill'", errors=["first", "second"])
+        )
+        resp = client.post("/skills", json=_create_body())
+        assert resp.status_code == 422
+        assert resp.json()["detail"] == "first; second"
+
+    def test_update_formats_the_db_layers_list(self, client, mock_db):
+        mock_db.get_skill = MagicMock(return_value=_make_skill_row(version=1))
+        mock_db.update_skill = MagicMock(
+            side_effect=SkillValidationError("Skill validation failed for 'demo-skill'", errors=["first", "second"])
+        )
+        resp = client.patch("/skills/demo-skill", json={"version": 1, "description": "new"})
+        assert resp.status_code == 422
+        assert resp.json()["detail"] == "first; second"
 
 
 class TestExtraFieldsRejected:
@@ -903,3 +931,13 @@ class TestTakenNameAnswersScopedCallers:
     def test_the_create_description_says_so(self, client):
         description = client.app.openapi()["paths"]["/skills"]["post"]["description"]
         assert "global namespace" in description and "409" in description
+
+
+def _real_client(tmp_path, settings):
+    """A client over a real SQLite database, for the checks the database layer owns."""
+    from agno.db.sqlite import SqliteDb
+
+    db = SqliteDb(db_file=str(tmp_path / "skills-router.db"))
+    app = FastAPI()
+    app.include_router(get_skills_router(dbs={"default": [db]}, settings=settings))
+    return TestClient(app), db

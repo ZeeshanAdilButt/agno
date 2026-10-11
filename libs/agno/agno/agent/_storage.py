@@ -1485,6 +1485,14 @@ def from_dict(
                 )
                 degraded_skills = config.pop("skills")
             else:
+                # The sync load cannot read an async database, so the strict check of the saved
+                # names could not run: refuse rather than load them unverified.
+                if strict and isinstance(skills_db, AsyncBaseDb):
+                    raise ComponentRehydrationError(
+                        f"{component_label} references skills {skill_names}, which a strict load cannot "
+                        "check against an async database. Pass a sync db=, or strict=False to load "
+                        "without the check."
+                    )
                 skills = Skills(
                     loaders=[DbSkills(skills_db, names=skill_names)], executor=skill_executor, load=not for_listing
                 )

@@ -1029,3 +1029,21 @@ def test_listing_builds_skills_without_reading_them(tmp_path, monkeypatch):
     assert len(reads) == 1 and not listed_agent.skills.has_unloaded_loaders()
     listed_agent.skills.reload()
     assert listed_agent.skills.get_skill_names() == ["greeter"]
+
+
+def test_strict_load_refuses_an_async_skills_db_it_cannot_check(tmp_path):
+    """A strict load verifies the saved names against the table, and the sync load cannot read
+    an async database: strict refuses rather than load unverified, lenient still loads with the
+    names unresolved until the first async refresh."""
+    from agno.db.sqlite.async_sqlite import AsyncSqliteDb
+
+    db = _db_with_skill(tmp_path)
+    config = Agent(name="a", skills=Skills(loaders=[DbSkills(db, names=["greeter"])])).to_dict()
+    async_db = AsyncSqliteDb(db_file=str(tmp_path / "exec.db"))
+
+    for _ in range(2):
+        with pytest.raises(ComponentRehydrationError, match="async"):
+            Agent.from_dict(config, db=async_db, strict=True)
+        lenient = Agent.from_dict(config, db=async_db)
+        assert lenient.skills is not None and lenient.skills.has_unloaded_loaders()
+        assert Agent.from_dict(config, db=db, strict=True).skills.get_skill_names() == ["greeter"]

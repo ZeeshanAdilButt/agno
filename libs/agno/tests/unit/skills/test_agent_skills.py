@@ -1515,62 +1515,72 @@ class StaleReadLoader(SkillLoader):
         return rows
 
 
-async def test_refreshes_of_one_view_take_turns_while_other_views_run() -> None:
-    """One lock per view: a second refresh for the same user waits for the first, another user's
-    refresh does not, and the view ends with what the later refresh read."""
+async def test_a_views_older_refresh_does_not_write_over_a_newer_one() -> None:
+    """Same view, two overlapping async refreshes: the later one is not held back behind the
+    older one's read, another view's refresh runs alongside, and the older one's commit is
+    dropped, so the view keeps what the later prompt advertised."""
     loader = StaleReadLoader()
     skills = Skills(loaders=[loader])
 
     for _ in range(2):
         loader.rows, loader.parked, loader.release = [_row("old-skill")], False, asyncio.Event()
         older = asyncio.create_task(skills.aget_system_prompt_snippet(user_id="alice"))
-        await asyncio.sleep(0)  # the older refresh has read old-skill and holds alice's lock
+        await asyncio.sleep(0)  # the older refresh has read old-skill and is parked
         loader.rows = [_row("new-skill")]
-        newer = asyncio.create_task(skills.aget_system_prompt_snippet(user_id="alice"))
-        await asyncio.sleep(0)
-        assert not newer.done()  # waiting on alice's lock
+        assert "new-skill" in await asyncio.wait_for(skills.aget_system_prompt_snippet(user_id="alice"), timeout=1)
         assert "new-skill" in await asyncio.wait_for(skills.aget_system_prompt_snippet(user_id="bob"), timeout=1)
 
         loader.release.set()
         await older
-        await newer
         assert list(skills._view_for("alice")) == ["new-skill"]
         assert skills.get_skill_names() == ["old-skill"]
 
 
-def test_refresh_locks_do_not_grow_with_users(sample_skill: Skill) -> None:
-    """A loader that never refreshes takes no lock, and a refresh that commits nothing (a failed
-    read) leaves no more locks behind than views are kept."""
+def test_refresh_bookkeeping_does_not_grow_with_users(sample_skill: Skill) -> None:
+    """A loader that never refreshes records nothing, a failed read commits nothing, and a
+    committed refresh is forgotten with its view, so nothing grows per user id."""
     from agno.skills.agent_skills import _USER_VIEWS_KEPT
 
     plain = Skills(loaders=[MockSkillLoader([sample_skill])])
     for n in range(300):
         plain.get_system_prompt_snippet(user_id=f"user-{n}")
-    assert plain._refresh_locks == {}
+    assert plain._committed_refreshes == {}
 
     failing = RefreshingLoader([sample_skill])
     failing.fail = True
     down = Skills(loaders=[failing])
     for n in range(300):
         down.get_system_prompt_snippet(user_id=f"user-{n}")
-    assert len(down._refresh_locks) <= _USER_VIEWS_KEPT + 1
+    assert down._committed_refreshes == {}
+
+    up = Skills(loaders=[RefreshingLoader([sample_skill])])
+    for n in range(300):
+        up.get_system_prompt_snippet(user_id=f"user-{n}")
+    assert set(up._committed_refreshes) == set(up._user_skills)
+    assert len(up._user_skills) == _USER_VIEWS_KEPT
 
 
-async def test_async_refresh_locks_do_not_grow_with_users(sample_skill: Skill) -> None:
-    """Async twin of test_refresh_locks_do_not_grow_with_users."""
+async def test_async_refresh_bookkeeping_does_not_grow_with_users(sample_skill: Skill) -> None:
+    """Async twin of test_refresh_bookkeeping_does_not_grow_with_users."""
     from agno.skills.agent_skills import _USER_VIEWS_KEPT
 
     plain = Skills(loaders=[MockSkillLoader([sample_skill])])
     for n in range(300):
         await plain.aget_system_prompt_snippet(user_id=f"user-{n}")
-    assert all(not locks for locks in plain._async_refresh_locks.values())
+    assert plain._committed_refreshes == {}
 
     failing = AsyncRefreshingLoader([sample_skill])
     failing.fail = True
     down = Skills(loaders=[failing])
     for n in range(300):
         await down.aget_system_prompt_snippet(user_id=f"user-{n}")
-    assert all(len(locks) <= _USER_VIEWS_KEPT + 1 for locks in down._async_refresh_locks.values())
+    assert down._committed_refreshes == {}
+
+    up = Skills(loaders=[AsyncRefreshingLoader([sample_skill])])
+    for n in range(300):
+        await up.aget_system_prompt_snippet(user_id=f"user-{n}")
+    assert set(up._committed_refreshes) == set(up._user_skills)
+    assert len(up._user_skills) == _USER_VIEWS_KEPT
 
 
 # ============================================================================
@@ -1692,6 +1702,34 @@ def test_two_users_sync_refreshes_interleave_without_mixing_views(
         assert _cached_names(skills) == {"test-skill"}
 
 
+def test_a_siblings_shared_rows_survive_a_commit_in_progress(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A no-user refresh assembles its results, then stores them. A user's refresh on another
+    thread tries to commit in between (a thread interleaving, made deterministic by starting it
+    from inside the merge) and fills the shared rows of a loader the no-user refresh failed to
+    read; those rows must survive the no-user store, whichever commit lands first."""
+    first, second = NestingLoader("first"), NestingLoader("second")
+    skills = Skills(loaders=[first, second])
+    assert skills.get_skill_names() == []
+    second.fail_next_no_user_read = True
+
+    sibling = threading.Thread(target=skills._refresh_loaders, kwargs={"user_id": "alice"}, daemon=True)
+    merge = skills._merge_loader_results
+
+    def merge_with_a_sibling_landing(results: Dict[int, List[Skill]]) -> Dict[str, Skill]:
+        monkeypatch.setattr(skills, "_merge_loader_results", merge)
+        sibling.start()
+        sibling.join(0.1)  # finishes at once unless the commit in progress keeps it out
+        return merge(results)
+
+    monkeypatch.setattr(skills, "_merge_loader_results", merge_with_a_sibling_landing)
+    skills._refresh_loaders()
+    sibling.join(1)
+    assert not sibling.is_alive()
+    assert skills.get_skill_names() == ["first-shared", "second-shared"]
+    assert not skills.has_unloaded_loaders()
+    assert "first-alice" in skills.get_system_prompt_snippet(user_id="alice")
+
+
 def test_a_failed_user_refresh_leaves_every_other_view_alone(
     sample_skill: Skill, minimal_skill: Skill, content_skill: Skill
 ) -> None:
@@ -1754,3 +1792,103 @@ async def test_evicting_a_view_during_its_own_refresh_keeps_the_refresh_result(
         assert list(skills._view_for("carol")) == ["test-skill", "carol-skill"]
         assert list(skills._view_for("alice")) == ["test-skill", "minimal-skill"]
         assert skills.get_skill_names() == ["test-skill"]
+
+
+# ============================================================================
+# SYNC AND ASYNC REFRESHES OF ONE VIEW
+# ============================================================================
+
+
+async def test_a_sync_and_an_async_refresh_of_one_view_cannot_land_out_of_order() -> None:
+    """A sync refresh on a worker thread and an async one on the loop, for the same view: the
+    one that started earlier and read older rows must not write over the later one's newer
+    rows, whichever path each took, for the shared view and for a user's."""
+    stale = []
+    for user_id in (None, "alice"):
+        loader = ParkableLoader({None: [_row("old-skill")]})
+        skills = Skills(loaders=[loader])
+        for older_path in ("sync", "async", "sync", "async"):
+            loader.owned[None], loader.parked = [_row("old-skill")], threading.Event()
+            # Each gate is also released on a timer, so a lock held across a read would fail here, not hang.
+            if older_path == "sync":
+                gate = loader.park_sync[user_id] = threading.Event()
+                threading.Timer(2, gate.set).start()
+                older = asyncio.create_task(asyncio.to_thread(skills.get_system_prompt_snippet, user_id=user_id))
+                assert await asyncio.to_thread(loader.parked.wait, 1)
+                loader.owned[None] = [_row("new-skill")]
+                assert "new-skill" in await skills.aget_system_prompt_snippet(user_id=user_id)
+                gate.set()
+            else:
+                agate = loader.park_async[user_id] = asyncio.Event()
+                asyncio.get_running_loop().call_later(2, agate.set)
+                older = asyncio.create_task(skills.aget_system_prompt_snippet(user_id=user_id))
+                await asyncio.sleep(0)
+                assert loader.parked.is_set()
+                loader.owned[None] = [_row("new-skill")]
+                assert "new-skill" in await asyncio.to_thread(skills.get_system_prompt_snippet, user_id=user_id)
+                agate.set()
+            await older
+            if list(skills._view_for(user_id)) != ["new-skill"]:
+                stale.append((user_id, older_path))
+    assert stale == []
+
+
+def test_two_sync_refreshes_of_one_view_keep_the_newer_rows() -> None:
+    """Two worker threads refresh the same view: the later one is not held back behind the
+    older one's read, and the older one's commit is dropped, so the view holds the newer rows."""
+    loader = ParkableLoader({None: [_row("old-skill")]})
+    skills = Skills(loaders=[loader])
+
+    for _ in range(2):
+        loader.owned[None], loader.parked = [_row("old-skill")], threading.Event()
+        gate = loader.park_sync["alice"] = threading.Event()
+        older = _in_thread(skills, "alice")
+        older.start()
+        try:
+            assert loader.parked.wait(1)
+            loader.owned[None] = [_row("new-skill")]
+            newer = _in_thread(skills, "alice")
+            newer.start()
+            newer.join(1)
+            assert not newer.is_alive()
+        finally:
+            gate.set()
+        older.join(1)
+        assert not older.is_alive()
+        assert list(skills._view_for("alice")) == ["new-skill"]
+
+
+async def test_a_sync_refresh_on_the_loop_does_not_wait_behind_a_workers_read() -> None:
+    """A skill tool with an async tool hook runs on the loop thread, and refreshes its user's
+    view there when none exists. A worker thread's refresh of the same view, parked on its
+    database read, must not hold the loop: a heartbeat keeps ticking while the worker's read
+    is awaited, and the view ends with the newer rows."""
+    loader = ParkableLoader({None: [_row("old-skill")]})
+    skills = Skills(loaders=[loader])
+    ticks = 0
+
+    async def heartbeat() -> None:
+        nonlocal ticks
+        while True:
+            await asyncio.sleep(0.005)
+            ticks += 1
+
+    beat = asyncio.create_task(heartbeat())
+    try:
+        for _ in range(2):
+            loader.owned[None], loader.parked = [_row("old-skill")], threading.Event()
+            gate = loader.park_sync["alice"] = threading.Event()
+            worker = asyncio.create_task(asyncio.to_thread(skills.get_system_prompt_snippet, user_id="alice"))
+            try:
+                assert await asyncio.to_thread(loader.parked.wait, 1)
+                loader.owned[None] = [_row("new-skill")]
+                threading.Timer(0.3, gate.set).start()
+                ticks = 0
+                skills.get_system_prompt_snippet(user_id="alice")  # on the loop thread, as such a tool call does
+                await worker
+            finally:
+                gate.set()
+            assert ticks >= 5, ticks
+            assert list(skills._view_for("alice")) == ["new-skill"]
+    finally:
+        beat.cancel()

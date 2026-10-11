@@ -750,3 +750,48 @@ def test_load_from_dict_and_dispatch_still_refuse_a_sandboxed_team(tmp_path):
         "names": ["greeter"],
         "requires_executor": True,
     }
+
+
+def test_listing_builds_skills_without_reading_them(tmp_path, monkeypatch):
+    """Team twin: a listing runs no skills query, a load and the dispatch helper read eagerly,
+    and a listed team reads on its first use."""
+    from agno.db.sqlite import SqliteDb
+
+    db = _make_db(tmp_path)
+    _create_skill_row(db, "greeter")
+    for n in range(3):
+        skills = Skills(loaders=[DbSkills(db, names=["greeter"])])
+        Team(id=f"plain-{n}", name=f"plain-{n}", members=[], db=db, skills=skills).save()
+    reads = []
+    original = SqliteDb.get_skills_with_content
+
+    def counting(self, *args, **kwargs):
+        reads.append(kwargs.get("names"))
+        return original(self, *args, **kwargs)
+
+    monkeypatch.setattr(SqliteDb, "get_skills_with_content", counting)
+
+    for _ in range(2):
+        reads.clear()
+        listed = sorted(get_teams(db), key=lambda team: team.id)
+        assert [team.id for team in listed] == ["plain-0", "plain-1", "plain-2"]
+        assert reads == []
+        for team in listed:
+            assert team.skills is not None and team.skills.has_unloaded_loaders()
+            assert team.skills.get_skill_names() == []
+            assert team.skills.get_skills_from_db() == ["greeter"]
+            assert team.to_dict()["skills"] == {"names": ["greeter"]}
+
+        reads.clear()
+        assert Team.load("plain-0", db=db).skills.get_skill_names() == ["greeter"]
+        assert len(reads) == 1
+        reads.clear()
+        assert get_team_by_id(db, "plain-1").skills.get_skill_names() == ["greeter"]
+        assert len(reads) == 1
+
+    listed_team = get_teams(db)[0]
+    reads.clear()
+    assert "greeter" in listed_team.skills.get_system_prompt_snippet()
+    assert len(reads) == 1 and not listed_team.skills.has_unloaded_loaders()
+    listed_team.skills.reload()
+    assert listed_team.skills.get_skill_names() == ["greeter"]

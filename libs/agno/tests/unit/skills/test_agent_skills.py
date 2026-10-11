@@ -1343,3 +1343,16 @@ def test_skill_tool_schemas_are_unchanged(mock_loader: MockSkillLoader) -> None:
     for tool in tools:
         tool.process_entrypoint()
     assert {tool.name: tool.parameters for tool in tools} == _SKILL_TOOL_SCHEMAS
+
+
+def test_skills_can_be_built_without_the_initial_load(sample_skill: Skill) -> None:
+    """A listing only needs the configured names: load=False builds the object with its loaders
+    unread, reports them unloaded, and reads them on the first refresh or reload()."""
+    loader = RefreshingLoader([sample_skill])
+    skills = Skills(loaders=[loader], load=False)
+    assert skills.has_unloaded_loaders() and skills.get_skill_names() == [] and loader.load_count == 0
+
+    assert "test-skill" in skills.get_system_prompt_snippet()
+    assert not skills.has_unloaded_loaders() and loader.load_count == 1
+    skills.reload()
+    assert skills.get_skill_names() == ["test-skill"] and loader.load_count == 2

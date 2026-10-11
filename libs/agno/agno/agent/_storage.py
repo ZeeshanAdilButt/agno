@@ -1270,9 +1270,9 @@ def from_dict(
             unresolvable serialized db config warns and falls back to the
             caller's db in both modes. Pass False to reconstruct as much as
             possible, e.g. for listings that must show degraded components.
-        for_listing: True from a listing, which never runs scripts: a recorded executor
-            that is not supplied leaves the skills off and marks the component instead
-            of refusing, so the listing shows it; save() refuses such a component.
+        for_listing: True from a listing: the skills are built without their initial read,
+            and a recorded executor that is not supplied drops them with a warning instead
+            of refusing; save() refuses the result.
 
     Returns:
         Agent: Reconstructed agent instance
@@ -1485,7 +1485,9 @@ def from_dict(
                 )
                 degraded_skills = config.pop("skills")
             else:
-                skills = Skills(loaders=[DbSkills(skills_db, names=skill_names)], executor=skill_executor)
+                skills = Skills(
+                    loaders=[DbSkills(skills_db, names=skill_names)], executor=skill_executor, load=not for_listing
+                )
                 if strict and not skills.has_unloaded_loaders():
                     # The eager load answered with the shared rows, so a name it did not return is
                     # either owned (resolved per request) or gone; one unscoped read tells which.

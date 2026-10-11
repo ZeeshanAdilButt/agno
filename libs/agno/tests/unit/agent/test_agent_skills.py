@@ -983,3 +983,49 @@ def test_load_from_dict_and_dispatch_still_refuse_a_sandboxed_agent(tmp_path):
         "names": ["greeter"],
         "requires_executor": True,
     }
+
+
+def test_listing_builds_skills_without_reading_them(tmp_path, monkeypatch):
+    """A listing only needs the saved names: its agents carry their loader unread, so a listing
+    of N agents runs no skills query, while a load and the dispatch helper still read eagerly
+    and a listed agent reads on its first use."""
+    from agno.db.sqlite import SqliteDb
+
+    db = _db_with_skill(tmp_path)
+    for n in range(3):
+        Agent(
+            id=f"plain-{n}", name=f"plain-{n}", db=db, skills=Skills(loaders=[DbSkills(db, names=["greeter"])])
+        ).save()
+    reads = []
+    original = SqliteDb.get_skills_with_content
+
+    def counting(self, *args, **kwargs):
+        reads.append(kwargs.get("names"))
+        return original(self, *args, **kwargs)
+
+    monkeypatch.setattr(SqliteDb, "get_skills_with_content", counting)
+
+    for _ in range(2):
+        reads.clear()
+        listed = sorted(get_agents(db), key=lambda agent: agent.id)
+        assert [agent.id for agent in listed] == ["plain-0", "plain-1", "plain-2"]
+        assert reads == []
+        for agent in listed:
+            assert agent.skills is not None and agent.skills.has_unloaded_loaders()
+            assert agent.skills.get_skill_names() == []
+            assert agent.skills.get_skills_from_db() == ["greeter"]
+            assert agent.to_dict()["skills"] == {"names": ["greeter"]}
+
+        reads.clear()
+        assert Agent.load("plain-0", db=db).skills.get_skill_names() == ["greeter"]
+        assert len(reads) == 1
+        reads.clear()
+        assert get_agent_by_id(db, "plain-1").skills.get_skill_names() == ["greeter"]
+        assert len(reads) == 1
+
+    listed_agent = get_agents(db)[0]
+    reads.clear()
+    assert "greeter" in listed_agent.skills.get_system_prompt_snippet()
+    assert len(reads) == 1 and not listed_agent.skills.has_unloaded_loaders()
+    listed_agent.skills.reload()
+    assert listed_agent.skills.get_skill_names() == ["greeter"]

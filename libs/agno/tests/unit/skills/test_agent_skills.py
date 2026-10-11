@@ -3,8 +3,9 @@
 import asyncio
 import json
 import logging
+import threading
 from pathlib import Path
-from typing import Callable, ClassVar, Dict, List, Optional
+from typing import Callable, ClassVar, Dict, List, Optional, Set
 
 import pytest
 
@@ -1570,3 +1571,186 @@ async def test_async_refresh_locks_do_not_grow_with_users(sample_skill: Skill) -
     for n in range(300):
         await down.aget_system_prompt_snippet(user_id=f"user-{n}")
     assert all(len(locks) <= _USER_VIEWS_KEPT + 1 for locks in down._async_refresh_locks.values())
+
+
+# ============================================================================
+# SHARED STATE ACROSS VIEWS
+# ============================================================================
+
+
+class ParkableLoader(OwnerScopedLoader):
+    """An OwnerScopedLoader whose reads keep the rows they saw when they started: one view's
+    next sync read can be parked on a threading event and its next async read on an asyncio
+    event, and a view's reads can be failed."""
+
+    def __init__(self, owned: Dict[Optional[str], List[Skill]]) -> None:
+        super().__init__(owned)
+        self.park_sync: Dict[Optional[str], threading.Event] = {}
+        self.park_async: Dict[Optional[str], asyncio.Event] = {}
+        self.parked = threading.Event()
+        self.failing: Set[Optional[str]] = set()
+
+    def _rows(self, user_id: Optional[str]) -> List[Skill]:
+        if user_id in self.failing:
+            raise RuntimeError("database down")
+        return super().load(user_id=user_id)
+
+    def load(self, *, user_id: Optional[str] = None) -> List[Skill]:
+        rows = self._rows(user_id)
+        gate = self.park_sync.pop(user_id, None)
+        if gate is not None:
+            self.parked.set()
+            gate.wait()
+        return rows
+
+    async def aload(self, *, user_id: Optional[str] = None) -> List[Skill]:
+        rows = self._rows(user_id)
+        gate = self.park_async.pop(user_id, None)
+        if gate is not None:
+            self.parked.set()
+            await gate.wait()
+        return rows
+
+
+def _parkable(sample_skill: Skill, minimal_skill: Skill, content_skill: Skill) -> ParkableLoader:
+    """The _owner_scoped_skills map, parkable."""
+    return ParkableLoader({None: [sample_skill], "alice": [minimal_skill], "bob": [content_skill]})
+
+
+def _cached_names(skills: Skills) -> Set[str]:
+    return {skill.name for rows in skills._loader_results.values() for skill in rows}
+
+
+def _in_thread(skills: Skills, user_id: Optional[str]) -> threading.Thread:
+    """A worker thread building the prompt for one view, started and joined by the test."""
+    return threading.Thread(target=skills.get_system_prompt_snippet, kwargs={"user_id": user_id}, daemon=True)
+
+
+def test_a_users_refresh_keeps_owned_rows_out_of_the_shared_state(
+    sample_skill: Skill, minimal_skill: Skill, content_skill: Skill
+) -> None:
+    """Owned rows reach only their user's view: never the per-loader cache, the shared mapping,
+    another user's view or a later anonymous prompt, whether the loader loaded eagerly or its
+    shared rows were first filled by a user's refresh."""
+    for lazy in (False, True):
+        skills = Skills(loaders=[_parkable(sample_skill, minimal_skill, content_skill)], lazy=lazy)
+        for _ in range(2):
+            skills.get_system_prompt_snippet(user_id="alice")
+            skills.get_system_prompt_snippet(user_id="bob")
+            assert _cached_names(skills) == {"test-skill"}
+            assert skills.get_skill_names() == ["test-skill"]
+            assert list(skills._view_for("alice")) == ["test-skill", "minimal-skill"]
+            assert list(skills._view_for("bob")) == ["test-skill", "content-skill"]
+            assert "minimal-skill" not in skills.get_system_prompt_snippet()
+            assert _cached_names(skills) == {"test-skill"}
+
+
+async def test_a_users_refresh_keeps_owned_rows_out_of_the_shared_state_async(
+    sample_skill: Skill, minimal_skill: Skill, content_skill: Skill
+) -> None:
+    for lazy in (False, True):
+        skills = Skills(loaders=[_parkable(sample_skill, minimal_skill, content_skill)], lazy=lazy)
+        for _ in range(2):
+            await skills.aget_system_prompt_snippet(user_id="alice")
+            await skills.aget_system_prompt_snippet(user_id="bob")
+            assert _cached_names(skills) == {"test-skill"}
+            assert skills.get_skill_names() == ["test-skill"]
+            assert list(skills._view_for("alice")) == ["test-skill", "minimal-skill"]
+            assert list(skills._view_for("bob")) == ["test-skill", "content-skill"]
+            assert "minimal-skill" not in await skills.aget_system_prompt_snippet()
+            assert _cached_names(skills) == {"test-skill"}
+
+
+def test_two_users_sync_refreshes_interleave_without_mixing_views(
+    sample_skill: Skill, minimal_skill: Skill, content_skill: Skill
+) -> None:
+    """Sync twin of the parked-user case: alice's read parked on a worker thread holds up neither
+    bob's refresh on another thread nor the anonymous one, and each view ends with its own rows."""
+    loader = _parkable(sample_skill, minimal_skill, content_skill)
+    skills = Skills(loaders=[loader])
+
+    for _ in range(2):
+        gate = loader.park_sync["alice"] = threading.Event()
+        loader.parked = threading.Event()
+        alice = _in_thread(skills, "alice")
+        alice.start()
+        try:
+            assert loader.parked.wait(1)
+            bob = _in_thread(skills, "bob")
+            bob.start()
+            bob.join(1)
+            assert not bob.is_alive()
+            assert "test-skill" in skills.get_system_prompt_snippet()
+            assert list(skills._view_for("bob")) == ["test-skill", "content-skill"]
+        finally:
+            gate.set()
+        alice.join(1)
+        assert not alice.is_alive()
+        assert list(skills._view_for("alice")) == ["test-skill", "minimal-skill"]
+        assert list(skills._view_for("bob")) == ["test-skill", "content-skill"]
+        assert skills.get_skill_names() == ["test-skill"]
+        assert _cached_names(skills) == {"test-skill"}
+
+
+def test_a_failed_user_refresh_leaves_every_other_view_alone(
+    sample_skill: Skill, minimal_skill: Skill, content_skill: Skill
+) -> None:
+    """Alice's read fails: her previous view still serves her prompt, and bob's view, the
+    shared mapping and the per-loader cache are untouched."""
+    loader = _parkable(sample_skill, minimal_skill, content_skill)
+    skills = Skills(loaders=[loader])
+
+    for _ in range(2):
+        skills.get_system_prompt_snippet(user_id="alice")
+        skills.get_system_prompt_snippet(user_id="bob")
+        loader.failing.add("alice")
+        assert "minimal-skill" in skills.get_system_prompt_snippet(user_id="alice")
+        assert list(skills._view_for("bob")) == ["test-skill", "content-skill"]
+        assert skills.get_skill_names() == ["test-skill"]
+        assert _cached_names(skills) == {"test-skill"}
+        loader.failing.clear()
+
+
+async def test_a_failed_user_refresh_leaves_every_other_view_alone_async(
+    sample_skill: Skill, minimal_skill: Skill, content_skill: Skill
+) -> None:
+    loader = _parkable(sample_skill, minimal_skill, content_skill)
+    skills = Skills(loaders=[loader])
+
+    for _ in range(2):
+        await skills.aget_system_prompt_snippet(user_id="alice")
+        await skills.aget_system_prompt_snippet(user_id="bob")
+        loader.failing.add("alice")
+        assert "minimal-skill" in await skills.aget_system_prompt_snippet(user_id="alice")
+        assert list(skills._view_for("bob")) == ["test-skill", "content-skill"]
+        assert skills.get_skill_names() == ["test-skill"]
+        assert _cached_names(skills) == {"test-skill"}
+        loader.failing.clear()
+
+
+async def test_evicting_a_view_during_its_own_refresh_keeps_the_refresh_result(
+    sample_skill: Skill, minimal_skill: Skill, content_skill: Skill, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Alice's refresh is in flight when two other users push her view out of the bounded dict:
+    her refresh still lands as the newest view, the others' views are untouched, and the bound holds."""
+    monkeypatch.setattr("agno.skills.agent_skills._USER_VIEWS_KEPT", 2)
+    loader = _parkable(sample_skill, minimal_skill, content_skill)
+    loader.owned["carol"] = [_row("carol-skill")]
+    skills = Skills(loaders=[loader])
+
+    for _ in range(2):
+        await skills.aget_system_prompt_snippet(user_id="alice")
+        gate = loader.park_async["alice"] = asyncio.Event()
+        parked = asyncio.create_task(skills.aget_system_prompt_snippet(user_id="alice"))
+        await asyncio.sleep(0)
+        try:
+            await skills.aget_system_prompt_snippet(user_id="bob")
+            await skills.aget_system_prompt_snippet(user_id="carol")
+            assert list(skills._user_skills) == ["bob", "carol"]
+        finally:
+            gate.set()
+        assert "minimal-skill" in await parked
+        assert list(skills._user_skills) == ["carol", "alice"]
+        assert list(skills._view_for("carol")) == ["test-skill", "carol-skill"]
+        assert list(skills._view_for("alice")) == ["test-skill", "minimal-skill"]
+        assert skills.get_skill_names() == ["test-skill"]

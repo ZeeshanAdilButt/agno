@@ -1,9 +1,10 @@
 """Unit tests for Skills orchestrator class."""
 
+import asyncio
 import json
 import logging
 from pathlib import Path
-from typing import ClassVar, Dict, List, Optional
+from typing import Callable, ClassVar, Dict, List, Optional
 
 import pytest
 
@@ -1356,3 +1357,176 @@ def test_skills_can_be_built_without_the_initial_load(sample_skill: Skill) -> No
     assert not skills.has_unloaded_loaders() and loader.load_count == 1
     skills.reload()
     assert skills.get_skill_names() == ["test-skill"] and loader.load_count == 2
+
+
+# ============================================================================
+# CONCURRENT REFRESHES
+# ============================================================================
+
+
+def _row(name: str) -> Skill:
+    return Skill(name=name, description="d", instructions="i", source_path=f"/path/to/{name}")
+
+
+class ParkedLoader(SkillLoader):
+    """Owner-scoped and per request; alice's async read waits to be released, every other read returns at once."""
+
+    refresh_per_request: ClassVar[bool] = True
+    owner_scoped: ClassVar[bool] = True
+
+    def __init__(self) -> None:
+        self.release = asyncio.Event()
+
+    def load(self, *, user_id: Optional[str] = None) -> List[Skill]:
+        return [_row(f"{user_id or 'shared'}-skill")]
+
+    async def aload(self, *, user_id: Optional[str] = None) -> List[Skill]:
+        if user_id == "alice":
+            await self.release.wait()
+        return [_row(f"{user_id or 'shared'}-skill")]
+
+
+async def test_one_users_async_refresh_does_not_wait_for_anothers() -> None:
+    """Every run of an agent shares one Skills object under AgentOS: a user's prompt build
+    parked on its database read must not hold up another user's prompt build."""
+    loader = ParkedLoader()
+    skills = Skills(loaders=[loader])
+
+    alice = asyncio.create_task(skills.aget_system_prompt_snippet(user_id="alice"))
+    await asyncio.sleep(0)  # alice is parked on her read
+    bob_prompt = await asyncio.wait_for(skills.aget_system_prompt_snippet(user_id="bob"), timeout=1)
+    assert "bob-skill" in bob_prompt
+
+    loader.release.set()
+    assert "alice-skill" in await alice
+    assert skills.get_skill_names() == ["shared-skill"]
+
+
+class UnloadedLoader(SkillLoader):
+    """Owner-scoped and per request, never loaded eagerly (an async database). Its first
+    no-user async read can park until released, and one task's no-user read can be failed."""
+
+    refresh_per_request: ClassVar[bool] = True
+    owner_scoped: ClassVar[bool] = True
+
+    def __init__(self, name: str, *, parks: bool = False) -> None:
+        self.name = name
+        self.parks = parks
+        self.release = asyncio.Event()
+        self.fail_for_task: Optional["asyncio.Task[None]"] = None
+
+    def load(self, *, user_id: Optional[str] = None) -> List[Skill]:
+        raise RuntimeError("async database: the sync read is unavailable")
+
+    async def aload(self, *, user_id: Optional[str] = None) -> List[Skill]:
+        if user_id is None and self.parks:
+            self.parks = False
+            await self.release.wait()
+        if user_id is None and asyncio.current_task() is self.fail_for_task:
+            raise RuntimeError("transient failure")
+        return [_row(f"{self.name}-{user_id or 'shared'}")]
+
+
+async def test_a_refresh_that_commits_last_keeps_a_siblings_shared_rows_async() -> None:
+    """A no-user refresh parked on one read resumes after a user's refresh has filled the
+    shared rows of both loaders; failing its own second read, it must build on what the
+    sibling committed rather than commit the empty snapshot it started from."""
+    first, second = UnloadedLoader("first", parks=True), UnloadedLoader("second")
+    skills = Skills(loaders=[first, second])
+    assert skills.get_skill_names() == []
+
+    parked = asyncio.create_task(skills._arefresh_loaders())
+    await asyncio.sleep(0)
+    second.fail_for_task = parked
+    await asyncio.wait_for(skills._arefresh_loaders(user_id="alice"), timeout=1)
+    assert skills.get_skill_names() == ["first-shared", "second-shared"]
+
+    first.release.set()
+    await parked
+    assert skills.get_skill_names() == ["first-shared", "second-shared"]
+    assert "first-alice" in skills.get_system_prompt_snippet(user_id="alice")
+
+
+class NestingLoader(SkillLoader):
+    """The sync twin of UnloadedLoader: never loaded eagerly, and its first no-user read runs
+    a sibling refresh on the same object (a thread interleaving, made deterministic)."""
+
+    refresh_per_request: ClassVar[bool] = True
+    owner_scoped: ClassVar[bool] = True
+
+    def __init__(self, name: str) -> None:
+        self.name = name
+        self.loaded_eagerly = False
+        self.nested: Optional[Callable[[], None]] = None
+        self.fail_next_no_user_read = False
+
+    def load(self, *, user_id: Optional[str] = None) -> List[Skill]:
+        if not self.loaded_eagerly:
+            self.loaded_eagerly = True
+            raise RuntimeError("async database: the sync read is unavailable")
+        if user_id is None and self.nested is not None:
+            nested, self.nested = self.nested, None
+            nested()
+        if user_id is None and self.fail_next_no_user_read:
+            self.fail_next_no_user_read = False
+            raise RuntimeError("transient failure")
+        return [_row(f"{self.name}-{user_id or 'shared'}")]
+
+
+def test_a_refresh_that_commits_last_keeps_a_siblings_shared_rows() -> None:
+    """Sync twin: a sibling refresh commits in the middle of a no-user refresh's reads, and the
+    no-user refresh then fails its own second read; it must keep the sibling's shared rows."""
+    first, second = NestingLoader("first"), NestingLoader("second")
+    skills = Skills(loaders=[first, second])
+    assert skills.get_skill_names() == []
+
+    def sibling() -> None:
+        skills._refresh_loaders(user_id="alice")
+        assert skills.get_skill_names() == ["first-shared", "second-shared"]
+        second.fail_next_no_user_read = True
+
+    first.nested = sibling
+    skills._refresh_loaders()
+    assert skills.get_skill_names() == ["first-shared", "second-shared"]
+    assert "first-alice" in skills.get_system_prompt_snippet(user_id="alice")
+
+
+class StaleReadLoader(SkillLoader):
+    """Owner-scoped and per request; the first async read keeps the rows it saw and parks until
+    released, so it commits after a later read that saw newer rows."""
+
+    refresh_per_request: ClassVar[bool] = True
+    owner_scoped: ClassVar[bool] = True
+
+    def __init__(self) -> None:
+        self.rows = [_row("old-skill")]
+        self.release = asyncio.Event()
+        self.parked = False
+
+    def load(self, *, user_id: Optional[str] = None) -> List[Skill]:
+        return list(self.rows)
+
+    async def aload(self, *, user_id: Optional[str] = None) -> List[Skill]:
+        rows = list(self.rows)
+        if not self.parked:
+            self.parked = True
+            await self.release.wait()
+        return rows
+
+
+async def test_a_users_older_refresh_does_not_write_over_a_newer_one() -> None:
+    """Same user, two overlapping refreshes: the one that read first but commits last is dropped,
+    so the view keeps what the later prompt advertised."""
+    loader = StaleReadLoader()
+    skills = Skills(loaders=[loader])
+
+    for _ in range(2):
+        loader.rows, loader.parked, loader.release = [_row("old-skill")], False, asyncio.Event()
+        older = asyncio.create_task(skills.aget_system_prompt_snippet(user_id="alice"))
+        await asyncio.sleep(0)  # the older refresh has read old-skill and is parked
+        loader.rows = [_row("new-skill")]
+        assert "new-skill" in await asyncio.wait_for(skills.aget_system_prompt_snippet(user_id="alice"), timeout=1)
+        loader.release.set()
+        await older
+        assert list(skills._view_for("alice")) == ["new-skill"]
+        assert skills.get_skill_names() == ["old-skill"]

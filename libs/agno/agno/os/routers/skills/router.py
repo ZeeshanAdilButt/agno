@@ -112,9 +112,16 @@ def _attach_routes(router: APIRouter, dbs: dict[str, list[Union[BaseDb, AsyncBas
         description=(
             "Create a skill. The name must be unique (409 if taken); id and version are "
             "server-managed (version starts at 1). A scoped (non-admin) caller owns what it "
-            "creates; a body `user_id` naming another user is 403. Names are one global "
-            "namespace, so a name another user owns is 409 for a scoped caller too."
+            "creates; a body `user_id` naming another user is 403."
         ),
+        responses={
+            409: {
+                "description": (
+                    "The name is taken. Names are one global namespace, so a scoped caller gets "
+                    "this for a name another user owns too."
+                )
+            }
+        },
     )
     async def create_skill(
         request: Request,
@@ -146,7 +153,8 @@ def _attach_routes(router: APIRouter, dbs: dict[str, list[Union[BaseDb, AsyncBas
             # Not str(e): with several errors it prefixes a count.
             raise HTTPException(status_code=422, detail="; ".join(e.errors))
         except SkillError as e:
-            # create_skill turns the duplicate-name integrity error into a SkillError
+            # create_skill turns the duplicate-name integrity error into a SkillError. Same 409
+            # whoever owns the name: it says the name is taken, never by whom.
             raise HTTPException(status_code=409, detail=str(e))
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"Failed to create skill: {e}")
@@ -187,6 +195,9 @@ def _attach_routes(router: APIRouter, dbs: dict[str, list[Union[BaseDb, AsyncBas
             "`user_id` is set at create and is not an updatable field. Skills with no owner "
             "(`user_id IS NULL`) may only be modified by an admin."
         ),
+        responses={
+            409: {"description": "Version conflict: the stored version has moved; the detail names the current one."}
+        },
     )
     async def update_skill(
         request: Request,

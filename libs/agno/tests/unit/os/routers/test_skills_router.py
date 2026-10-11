@@ -928,9 +928,9 @@ class TestTakenNameAnswersScopedCallers:
         resp = scoped.post("/skills", json=_create_body())
         assert resp.status_code == 409
 
-    def test_the_create_description_says_so(self, client):
-        description = client.app.openapi()["paths"]["/skills"]["post"]["description"]
-        assert "global namespace" in description and "409" in description
+    def test_the_create_route_declares_the_409(self, client):
+        declared = client.app.openapi()["paths"]["/skills"]["post"]["responses"]["409"]["description"]
+        assert "global namespace" in declared
 
 
 def _real_client(tmp_path, settings):

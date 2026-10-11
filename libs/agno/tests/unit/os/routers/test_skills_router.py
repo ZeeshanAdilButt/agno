@@ -887,3 +887,19 @@ class TestRouterRegistration:
         agent_os._reprovision_routers(app)
         assert client.get("/skills").status_code == 200
         assert client.get("/skills/demo-skill").status_code == 200
+
+
+class TestTakenNameAnswersScopedCallers:
+    """Names are one global namespace: a scoped caller creating a name another user owns gets
+    the same 409 as anyone else, which says the name exists by design; the route description
+    says so."""
+
+    def test_scoped_create_of_a_taken_name_is_409(self, mock_db, settings):
+        scoped = _scoped_client(mock_db, settings, user_isolation_enabled=True, user_id="user-B", scopes=[])
+        mock_db.create_skill = MagicMock(side_effect=SkillError("Creating skill 'demo-skill' violated a constraint"))
+        resp = scoped.post("/skills", json=_create_body())
+        assert resp.status_code == 409
+
+    def test_the_create_description_says_so(self, client):
+        description = client.app.openapi()["paths"]["/skills"]["post"]["description"]
+        assert "global namespace" in description and "409" in description

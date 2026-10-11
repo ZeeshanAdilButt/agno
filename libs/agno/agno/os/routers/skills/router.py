@@ -112,9 +112,9 @@ def _attach_routes(router: APIRouter, dbs: dict[str, list[Union[BaseDb, AsyncBas
         summary="Create Skill",
         description=(
             "Create a skill. The name must be unique (409 if taken); id and version are "
-            "server-managed (version starts at 1). For a scoped (non-admin) caller, the "
-            "body's `user_id` must be omitted/null (a shared skill) or match the caller "
-            "(mismatch -> 403)."
+            "server-managed (version starts at 1). A scoped (non-admin) caller owns what it "
+            "creates; a body `user_id` naming another user is 403. Names are one global "
+            "namespace, so a name another user owns is 409 for a scoped caller too."
         ),
     )
     async def create_skill(

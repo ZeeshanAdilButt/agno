@@ -422,7 +422,7 @@ def _skill_instructions(skills: Skills, user_id: str, skill_name: str) -> dict:
 async def test_a_users_async_refresh_fills_the_shared_mapping_once(async_sqlite_db) -> None:
     """The eager load cannot await an async database, so a service whose every request carries
     a user would otherwise never load the shared rows: the loader would count as never loaded
-    and a save would write no names."""
+    and the shared mapping would never fill."""
     await _seed_async_owned_skills(async_sqlite_db)
     skills = Skills(loaders=[DbSkills(async_sqlite_db)])
     assert skills.has_unloaded_loaders()
@@ -504,7 +504,7 @@ def test_only_database_backed_skills_are_persisted(tmp_path, sqlite_db, monkeypa
 
 
 def test_database_backed_skills_still_round_trip(sqlite_db) -> None:
-    """The real case must be untouched: DB skills are still saved by name."""
+    """The real case must be untouched: a database loader's skills are the names this answers."""
     sqlite_db.create_skill({"name": "alpha", "description": "d", "instructions": "i"})
     sqlite_db.create_skill({"name": "beta", "description": "d", "instructions": "i"})
 

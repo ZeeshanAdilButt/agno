@@ -6,7 +6,7 @@ Mirrors the team skills tests to verify parity:
 - Skills system prompt snippet is injected into the system message
 - Skills system prompt snippet is omitted when agent.skills is None
 - deep_copy shares the Skills instance by reference (shared resource)
-- save stores skill names; load re-resolves them from the database's skills table
+- save stores skill names or the all-rows marker; load re-resolves them from the database's skills table
 
 The tool registration and prompt injection are hand-maintained sync/async twins on the Agent
 (``_tools.get_tools``/``aget_tools``, ``_messages.get_system_message``/``aget_system_message``),
@@ -166,7 +166,7 @@ def test_deep_copy_shares_skills_by_reference():
 
 
 # ---------------------------------------------------------------------------
-# Persistence tests (save stores skill names; load re-resolves them from the db)
+# Persistence tests (save stores skill names or the all-rows marker; load re-resolves them from the db)
 # ---------------------------------------------------------------------------
 
 
@@ -1033,6 +1033,7 @@ def test_strict_load_refuses_an_async_skills_db_it_cannot_check(tmp_path):
         assert Agent.from_dict(config, db=db, strict=True).skills.get_skill_names() == ["greeter"]
 
 
+# ============================================================================
 # SAVES WHILE A LOADER HAS NOT LOADED (ASYNC SKILLS DATABASE)
 # ============================================================================
 

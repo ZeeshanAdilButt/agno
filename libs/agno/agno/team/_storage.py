@@ -1317,7 +1317,7 @@ def from_dict(
             del config["knowledge"]
 
     # --- Handle Skills reconstruction ---
-    # Name references, re-resolved from the skills table like members by id.
+    # Name references or the all-rows marker, re-resolved from the skills table like members by id.
     degraded_skills: Optional[Dict[str, Any]] = None
     if "skills" in config and isinstance(config["skills"], dict):
         # "all" loads every row; names would freeze the set at save time.

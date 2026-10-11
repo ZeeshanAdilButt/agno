@@ -6,7 +6,7 @@ Verifies that:
 - Skills system prompt snippet is injected into the system message (sync and async)
 - Skills system prompt snippet is omitted when team.skills is None
 - deep_copy shares the Skills instance by reference (shared resource)
-- save stores skill names; load re-resolves them from the database's skills table
+- save stores skill names or the all-rows marker; load re-resolves them from the database's skills table
 """
 
 import json
@@ -165,7 +165,7 @@ async def test_asystem_message_contains_skills_snippet():
 
 
 # ---------------------------------------------------------------------------
-# Persistence tests (save stores skill names; load re-resolves them from the db)
+# Persistence tests (save stores skill names or the all-rows marker; load re-resolves them from the db)
 # ---------------------------------------------------------------------------
 
 
@@ -818,6 +818,7 @@ def test_strict_load_refuses_an_async_skills_db_it_cannot_check(tmp_path):
         assert Team.from_dict(config, db=db, strict=True).skills.get_skill_names() == ["greeter"]
 
 
+# ============================================================================
 # SAVES WHILE A LOADER HAS NOT LOADED (ASYNC SKILLS DATABASE)
 # ============================================================================
 

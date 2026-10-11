@@ -136,7 +136,7 @@ class Skills:
         fresh: Dict[int, List[Skill]] = {}
         # The shared rows of a loader the shared mapping never loaded, read alongside the
         # user's: the eager load cannot await an async database, and under user-only
-        # traffic nothing else would fill what saves and strict loads read.
+        # traffic nothing else would fill what strict loads and the saved names read.
         shared: Dict[int, List[Skill]] = {}
         for index, loader in enumerate(self.loaders):
             if not loader.refresh_per_request:
@@ -273,10 +273,10 @@ class Skills:
         return any(index not in self._loader_results for index in range(len(self.loaders)))
 
     def get_skills_from_db(self) -> List[str]:
-        """The skill names a stored agent or team saves to re-resolve this object.
+        """The skill names to_config saves for a stored agent or team when no loader reads every row.
 
-        Only DbSkills-produced skills are saved (anything else would resolve to the wrong row
-        or nothing, and is named in one warning per instance), plus each database loader's
+        Only DbSkills-produced skills count (anything else would resolve to the wrong row or
+        nothing, and is named in one warning per instance), plus each database loader's
         configured names, so a save during an outage preserves them instead of erasing.
         """
         from agno.skills.loaders.db import DbSkills
@@ -318,7 +318,9 @@ class Skills:
         config: Dict[str, Any] = {}
         if any(isinstance(loader, DbSkills) and loader.names is None for loader in self.loaders):
             # A marker, not names: names would freeze the rows present at save time, and an
-            # async database has none loaded before its first request.
+            # async database has none loaded before its first request. A load resolves it
+            # against the config's database, so a loader on another database is swapped for
+            # that one's rows.
             config["all"] = True
         elif names:
             config["names"] = names
